@@ -54,7 +54,7 @@ func redirectPolicyFunc(req *http.Request, via []*http.Request) error {
 
 func main() {
 	config := Config{}
-	data, err := ioutil.ReadFile("tests/simple.yaml")
+	data, err := ioutil.ReadFile("tests/test.yaml")
 	check(err)
 
 	err = yaml.Unmarshal(data, &config)

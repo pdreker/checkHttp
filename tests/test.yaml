@@ -1,0 +1,28 @@
+---
+checks:
+  - name: Dont follow redirect
+    request:
+      url: http://www.heise.de
+    response:
+      code: 301
+  - name: Follow redirect
+    request:
+      url: http://www.heise.de
+      followRedirects: true
+    response:
+      code: 200
+  - name: Check headers
+    request:
+      url: https://www.google.com
+      followRedirects: true
+    response:
+      headers:
+        content-type: text/html; charset=ISO-8859-1
+  - name: BadSSL
+    request:
+      url: https://wrong.host.badssl.com
+      insecureSkipVerify: true
+    response:
+      headers:
+        content-type: text/html
+      code: 200
