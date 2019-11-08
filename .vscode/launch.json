@@ -12,7 +12,7 @@
             "program": "${fileDirname}",
             "cwd": "/Users/pd/Code/go/src/github.com/pdreker/checkHttp",
             "env": {},
-            "args": []
+            "args": ["--config", "/Users/pd/Code/go/src/github.com/pdreker/checkHttp/tests/test.yaml"]
         }
     ]
 }

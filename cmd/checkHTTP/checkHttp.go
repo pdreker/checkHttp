@@ -2,45 +2,16 @@ package main
 
 import (
 	"crypto/tls"
-	"fmt"
+	"flag"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"gopkg.in/yaml.v2"
 )
-
-// HTTPRequest encapsulates the HTTP request to be used
-type HTTPRequest struct {
-	URL                string
-	InsecureSkipVerify bool `yaml:"insecureSkipVerify"`
-	FollowRedirects    bool `yaml:"followRedirects"`
-	Headers            map[string]string
-}
-
-// UnmarshalYAML unmarshals the HTTPRequest portion of the configured request and sets the defaults
-func (r *HTTPRequest) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type rawReq HTTPRequest
-	raw := rawReq{InsecureSkipVerify: false, FollowRedirects: false}
-	if err := unmarshal(&raw); err != nil {
-		return err
-	}
-
-	*r = HTTPRequest(raw)
-	return nil
-}
-
-// Config defines the YAML structure for the imput file
-type Config struct {
-	Checks []struct {
-		Name     string
-		Request  HTTPRequest
-		Response struct {
-			Code    int
-			Headers map[string]string
-		}
-	} `yaml:",flow"`
-}
 
 func check(e error) {
 	if e != nil {
@@ -48,22 +19,28 @@ func check(e error) {
 	}
 }
 
-func redirectPolicyFunc(req *http.Request, via []*http.Request) error {
+func doNotFollowRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+var inputFile = flag.String("config", "checkhttp.yaml", "Config file specifying the checks to be performed")
+
 func main() {
-	config := Config{}
-	data, err := ioutil.ReadFile("tests/test.yaml")
+	logger := log.NewLogfmtLogger(os.Stdout)
+	logger = level.NewFilter(logger, level.AllowInfo())
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+
+	flag.Parse()
+	config := HTTPRequests{}
+	data, err := ioutil.ReadFile(*inputFile)
 	check(err)
 
 	err = yaml.Unmarshal(data, &config)
 	check(err)
-	//fmt.Printf("--- config:\n%v\n\n", config)
 
 	d, err := yaml.Marshal(&config)
 	check(err)
-	fmt.Printf("--- config dump:\n%s\n\n", d)
+	level.Info(logger).Log("event", "parsed config", "config", d)
 
 	// index 0:        verify TLS, do not follow redirects (default)
 	// index 1:        verify TLS,        follow redirects
@@ -71,6 +48,7 @@ func main() {
 	// index 3: do not verify TLS,        follow redirects
 	var httpClients [4]*http.Client
 
+	level.Info(logger).Log("event", "initializing HTTP transports")
 	defaultTransport := http.DefaultTransport.(*http.Transport)
 	httpTransportInsecure := &http.Transport{
 		Proxy:                 defaultTransport.Proxy,
@@ -82,13 +60,21 @@ func main() {
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	}
 	httpTransport := &http.Transport{}
-	httpClients[0] = &http.Client{Transport: httpTransport, CheckRedirect: redirectPolicyFunc}
+	level.Info(logger).Log("event", "HTTP transports initialized")
+
+	level.Info(logger).Log("event", "initializing HTTP clients")
+	httpClients[0] = &http.Client{Transport: httpTransport, CheckRedirect: doNotFollowRedirectPolicy}
 	httpClients[1] = &http.Client{Transport: httpTransport}
-	httpClients[2] = &http.Client{Transport: httpTransportInsecure, CheckRedirect: redirectPolicyFunc}
+	httpClients[2] = &http.Client{Transport: httpTransportInsecure, CheckRedirect: doNotFollowRedirectPolicy}
 	httpClients[3] = &http.Client{Transport: httpTransportInsecure}
+	level.Info(logger).Log("event", "HTTP clients initialized")
+
+	var checkResults []Result
 
 	for _, httpCheck := range config.Checks {
-		fmt.Printf("--- Check: %s\n", httpCheck.Name)
+		result := new(Result)
+		result.Name = httpCheck.Name
+
 		req, err := http.NewRequest("GET", httpCheck.Request.URL, nil)
 		check(err)
 		for header, content := range httpCheck.Request.Headers {
@@ -114,43 +100,48 @@ func main() {
 			resp, err = httpClients[clientIndex].Do(req)
 		}
 		check(err)
-		//fmt.Printf("   - Status: %d\n", resp.StatusCode)
 
 		if httpCheck.Response.Code != 0 {
 			if resp.StatusCode != httpCheck.Response.Code {
-				fmt.Printf("Status Code: FAILED\n")
+				result.Code = false
+				result.ResponseCode = resp.StatusCode
+				result.ExpectCode = httpCheck.Response.Code
 			} else {
-				fmt.Printf("Status Code: OK\n")
+				result.Code = true
 			}
 		} else {
-			fmt.Printf("Status Code: n/a\n")
+			result.Code = true
 		}
-
-		//fmt.Printf("DEBUG: Response Headers:\n")
-		//for k, v := range resp.Header {
-		//	fmt.Printf("%s: ", k)
-		//	for _, v := range v {
-		//		fmt.Printf("%s, ", v)
-		//	}
-		//	fmt.Printf("\n")
-		//}
 
 		if httpCheck.Response.Headers != nil {
 			for header, content := range httpCheck.Response.Headers {
-				// fmt.Printf("Checking Header: %s == %s\n", header, content)
 				if val, present := resp.Header[http.CanonicalHeaderKey(header)]; present {
-					// fmt.Printf("Header found in response: %s: %s\n", header, val)
 					if val[0] != content {
-						fmt.Printf("Headers: FAILED\n")
+						result.Headers = false
+						result.ResponseHeader[header] = [2]string{content, val[0]}
 					} else {
-						fmt.Printf("Headers: OK\n")
+						result.Headers = true
 					}
 				} else {
-					fmt.Printf("Headers: MISSING\n")
+					// MISSING
+					result.Headers = false
+					result.ResponseHeader[header] = [2]string{content, "MISSING"}
 				}
 			}
 		} else {
-			fmt.Printf("Headers: n/a\n")
+			result.Headers = true
+		}
+		checkResults = append(checkResults, *result)
+	}
+	for _, result := range checkResults {
+		level.Info(logger).Log("check", result.Name, "code", result.Code, "headers", result.Headers)
+		if !result.Code {
+			level.Error(logger).Log("check", result.Name, "code-actual", result.ResponseCode, "code-want", result.ExpectCode)
+		}
+		if !result.Headers {
+			for k, v := range result.ResponseHeader {
+				level.Error(logger).Log("check", result.Name, "header", k, "header-actual", v[1], "header-want", v[0])
+			}
 		}
 	}
 }
